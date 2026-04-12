@@ -32,7 +32,11 @@ from transformers.models.llava_next.modeling_llava_next import (
 )
 
 from vllm.config import VllmConfig
-from vllm.distributed.parallel_state import get_pp_group
+from vllm.distributed.parallel_state import (
+    get_pp_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFieldConfig
@@ -895,14 +899,34 @@ class Granite4VisionForConditionalGeneration(
                 if hasattr(module, "_get_shard_offset_mapping"):
                     shard_offset = module._get_shard_offset_mapping(shard_id)
                     if shard_offset is not None:
-                        shard_size = delta.shape[0]
+                        # Under TP, shard_offset and sizes from
+                        # _get_shard_offset_mapping are already TP-local
+                        # (num_heads is per-rank), but delta is full-size.
+                        # Slice delta's dim 0 for this TP rank.
+                        tp_rank = get_tensor_model_parallel_rank()
+                        tp_size = get_tensor_model_parallel_world_size()
+                        shard_size = delta.shape[0] // tp_size
+                        tp_delta = delta.narrow(
+                            0, tp_rank * shard_size, shard_size)
                         shard = param.data[shard_offset:shard_offset + shard_size]
                         param.data[shard_offset:shard_offset + shard_size] = (
-                            shard.float() + delta.to(shard.device)).to(shard.dtype)
+                            shard.float() + tp_delta.to(shard.device)
+                        ).to(shard.dtype)
                         return True
             # Direct param (o_proj, input_linear, output_linear)
             if name in params_dict:
                 param = params_dict[name]
+                # Under TP, param is already sharded but delta is full-size.
+                # Slice delta to match: dim 0 for column-parallel, dim 1 for
+                # row-parallel.
+                if delta.shape != param.data.shape:
+                    tp_rank = get_tensor_model_parallel_rank()
+                    for dim in range(delta.dim()):
+                        if delta.shape[dim] != param.data.shape[dim]:
+                            shard_size = param.data.shape[dim]
+                            offset = tp_rank * shard_size
+                            delta = delta.narrow(dim, offset, shard_size)
+                            break
                 param.data = (param.data.float() + delta.to(param.device)).to(param.dtype)
                 return True
             return False
