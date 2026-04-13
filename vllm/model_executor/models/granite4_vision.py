@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """vLLM implementation of Granite 4 Vision (ibm-granite/granite-4.0-3b-vision).
 
 Fresh implementation based on the HF reference model, following the patterns
@@ -292,10 +294,11 @@ class Granite4VisionForConditionalGeneration(
     """vLLM implementation of Granite 4 Vision.
 
     Architecture:
-    - SigLIP vision tower → WindowQFormerDownsampler projectors
+    - SigLIP vision tower -> WindowQFormerDownsampler projectors
     - Deepstack: 4 vision layers projected and injected at 4 LLM layers
     - Spatial: 4 offset groups from last vision layer injected at 4 more LLM layers
-    - GraniteMoeHybrid language backbone with embedding_multiplier and residual_multiplier
+    - GraniteMoeHybrid language backbone with
+      embedding_multiplier and residual_multiplier
     - logits_scaling via LogitsProcessor
 
     The outer model runs the LLM layer loop directly (like HF does) to inject
@@ -317,8 +320,9 @@ class Granite4VisionForConditionalGeneration(
     }
     embedding_modules = {}
 
-    # Weight mapping: HF checkpoint → vLLM parameter names
-    # HF has: model.language_model.layers.0... → vLLM: language_model.model.layers.0...
+    # Weight mapping: HF checkpoint -> vLLM parameter names
+    # HF: model.language_model.layers.0...
+    # vLLM: language_model.model.layers.0...
     # (because GraniteMoeHybridForCausalLM.model = GraniteMoeHybridModel)
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
@@ -683,8 +687,9 @@ class Granite4VisionForConditionalGeneration(
             return embeds * lm_inner.embedding_multiplier
 
         # --- Vision path ---
-        # HF flow: embed → masked_fill(vision_mask, 0.0) → multiply by embedding_multiplier
-        # Then layer loop adds vision features via masked_scatter (never in inputs_embeds).
+        # HF flow: embed -> masked_fill(0) -> multiply
+        # by embedding_multiplier. Layer loop adds vision
+        # features via masked_scatter (never in inputs_embeds).
 
         # 1. Get text embeddings
         text_embeds = lm_inner.embed_input_ids(input_ids)
@@ -927,7 +932,8 @@ class Granite4VisionForConditionalGeneration(
                             offset = tp_rank * shard_size
                             delta = delta.narrow(dim, offset, shard_size)
                             break
-                param.data = (param.data.float() + delta.to(param.device)).to(param.dtype)
+                merged = param.data.float() + delta.to(param.device)
+                param.data = merged.to(param.dtype)
                 return True
             return False
 
