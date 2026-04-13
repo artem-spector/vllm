@@ -65,6 +65,7 @@ from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     WeightsMapper,
+    _merge_multimodal_embeddings,
     init_vllm_registered_model,
     maybe_prefix,
 )
@@ -696,9 +697,6 @@ class Granite4VisionForConditionalGeneration(
 
         # 2. Zero out image positions (HF: inputs_embeds.masked_fill(vision_mask, 0.0))
         #    _merge_multimodal_embeddings writes our zero-tensors here, same effect.
-        from vllm.model_executor.models.utils import (
-            _merge_multimodal_embeddings,
-        )
         _merge_multimodal_embeddings(
             inputs_embeds=text_embeds,
             multimodal_embeddings=multimodal_embeddings,
