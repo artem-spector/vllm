@@ -420,6 +420,10 @@ _MULTIMODAL_MODELS = {
         "granite4_vision",
         "Granite4VisionForConditionalGeneration",
     ),
+    "Granite4VisionNaflexForConditionalGeneration": (
+        "granite4_vision_naflex",
+        "Granite4VisionNaflexForConditionalGeneration",
+    ),
     "H2OVLChatModel": ("h2ovl", "H2OVLChatModel"),
     "InternVLChatModel": ("internvl", "InternVLChatModel"),
     "InternS1ForConditionalGeneration": (

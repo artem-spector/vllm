@@ -19,6 +19,7 @@ __all__ = [
     "FunASRProcessor",
     "GLM4VProcessor",
     "Granite4VisionProcessor",
+    "Granite4VisionNaflexProcessor",
     "H2OVLProcessor",
     "Moondream3Processor",
     "InternVLProcessor",
@@ -57,6 +58,9 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "FunASRProcessor": "vllm.transformers_utils.processors.funasr",
     "GLM4VProcessor": "vllm.transformers_utils.processors.glm4v",
     "Granite4VisionProcessor": "vllm.transformers_utils.processors.granite4_vision",
+    "Granite4VisionNaflexProcessor": (
+        "vllm.transformers_utils.processors.granite4_vision_naflex"
+    ),
     "H2OVLProcessor": "vllm.transformers_utils.processors.h2ovl",
     "InternVLProcessor": "vllm.transformers_utils.processors.internvl",
     "IsaacProcessor": "vllm.transformers_utils.processors.isaac",
