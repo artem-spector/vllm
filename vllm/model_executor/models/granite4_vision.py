@@ -392,6 +392,9 @@ class Granite4VisionProcessingInfo(LlavaNextProcessingInfo):
 class Granite4VisionMultiModalProcessor(
     BaseLlavaNextMultiModalProcessor[Granite4VisionProcessingInfo]
 ):
+    def _get_hf_processor_text(self, mm_counts: Mapping[str, int]) -> str:
+        return self.dummy_inputs.get_dummy_text(mm_counts)
+
     def _get_mm_fields_config(
         self,
         hf_inputs: BatchFeature,
