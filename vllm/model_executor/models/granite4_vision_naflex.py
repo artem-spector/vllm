@@ -436,7 +436,17 @@ class Siglip2NaflexVisionModel(nn.Module):
         )
 
         if output_hidden_states:
-            encoder_out[-1] = self.vision_model.post_layernorm(encoder_out[-1])
+            # Do NOT apply post_layernorm to the returned hidden-states list.
+            # HF's siglip2_local.py Siglip2VisionModel.forward keeps
+            # `hidden_states` (the per-layer tuple used for deepstack/spatial
+            # feature extraction, e.g. via spatial_vision_layer=-1) strictly
+            # raw -- post_layernorm is applied only to a SEPARATE
+            # `last_hidden_state` field that this port's DeepStack/spatial
+            # projectors never consume. Applying it here diverged norms by
+            # >20x at the final layer (confirmed via dump_gv5.py: HF
+            # vt_hidden_27 norm=22594 vs this code's 1572 pre-fix), which
+            # fed a wrong-scale feature into the spatial_vision_layer=-1
+            # projectors and produced garbled generation on some inputs.
             return encoder_out
 
         return self.vision_model.post_layernorm(encoder_out)
