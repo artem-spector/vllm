@@ -70,6 +70,7 @@ from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import get_act_fn
+from vllm.model_executor.layers.attention import MMEncoderAttention
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbeddingBase
@@ -255,10 +256,16 @@ def _apply_vision_rope(q, k, cos, sin, scale: float):
 
 
 class Siglip2NaflexAttention(nn.Module):
-    """Plain full attention over the packed (batch=1) sequence -- no
-    per-image blocking. The HF reference forward() never constructs or
-    passes an attention_mask, so every patch from every image in the packed
-    batch attends to every other patch freely."""
+    """Per-image (varlen) attention over the packed (batch=1) sequence.
+
+    Each image attends only to its own patches (block-diagonal, via cu_seqlens).
+    This matches how the checkpoint was trained: the HF reference forces the
+    vision tower to flash_attention_2 and passes per-image position_ids that
+    reset to 0 at each image boundary, which transformers' FA2 path turns into
+    varlen cu_seqlens. vLLM's encoder runner packs images from DIFFERENT
+    requests into one embed_multimodal call, so full attention here would let
+    unrelated images attend to each other and make every image's features
+    depend on batch composition."""
 
     def __init__(
         self,
@@ -278,30 +285,38 @@ class Siglip2NaflexAttention(nn.Module):
         self.v_proj = nn.Linear(self.embed_dim, self.embed_dim)
         self.out_proj = nn.Linear(self.embed_dim, self.embed_dim)
 
+        self.attn = MMEncoderAttention(
+            num_heads=self.num_heads,
+            head_size=self.head_dim,
+            scale=self.scale,
+            prefix=f"{prefix}.attn",
+        )
+
         self.use_rope = getattr(config, "use_rope", False)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         batch_size, seq_length, embed_dim = hidden_states.shape
 
-        q = self.q_proj(hidden_states)
-        k = self.k_proj(hidden_states)
-        v = self.v_proj(hidden_states)
-
-        q = q.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+        q = self.q_proj(hidden_states).view(batch_size, seq_length, self.num_heads, self.head_dim)
+        k = self.k_proj(hidden_states).view(batch_size, seq_length, self.num_heads, self.head_dim)
+        v = self.v_proj(hidden_states).view(batch_size, seq_length, self.num_heads, self.head_dim)
 
         if self.use_rope and position_embeddings is not None:
             cos, sin = position_embeddings
             rope_scale = getattr(self.config, "rope_scale", 0.0)
-            q, k = _apply_vision_rope(q, k, cos, sin, scale=rope_scale)
+            q, k = _apply_vision_rope(q.transpose(1, 2), k.transpose(1, 2), cos, sin, scale=rope_scale)
+            q, k = q.transpose(1, 2), k.transpose(1, 2)
 
-        attn_output = F.scaled_dot_product_attention(q, k, v, scale=self.scale)
-        attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_length, embed_dim)
+        attn_output = self.attn(
+            query=q, key=k, value=v, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
+        )
+        attn_output = attn_output.reshape(batch_size, seq_length, embed_dim)
         return self.out_proj(attn_output)
 
 
@@ -332,11 +347,15 @@ class Siglip2NaflexEncoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.layer_norm1(hidden_states)
-        hidden_states = self.self_attn(hidden_states, position_embeddings=position_embeddings)
+        hidden_states = self.self_attn(
+            hidden_states, cu_seqlens, max_seqlen, position_embeddings=position_embeddings
+        )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -360,13 +379,17 @@ class Siglip2NaflexEncoder(nn.Module):
     def forward(
         self,
         inputs_embeds: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         return_all_hidden_states: bool = False,
     ) -> torch.Tensor | list[torch.Tensor]:
         hidden_states = inputs_embeds
         all_hidden_states = [hidden_states] if return_all_hidden_states else None
         for layer in self.layers:
-            hidden_states = layer(hidden_states, position_embeddings=position_embeddings)
+            hidden_states = layer(
+                hidden_states, cu_seqlens, max_seqlen, position_embeddings=position_embeddings
+            )
             if return_all_hidden_states:
                 all_hidden_states.append(hidden_states)
         return all_hidden_states if return_all_hidden_states else hidden_states
@@ -429,8 +452,18 @@ class Siglip2NaflexVisionModel(nn.Module):
             else None
         )
 
+        # Per-image sequence boundaries for varlen attention (see
+        # Siglip2NaflexAttention). int32 is what the FA varlen kernels require.
+        patch_counts = spatial_shapes[:, 0] * spatial_shapes[:, 1]
+        cu_seqlens = F.pad(patch_counts.cumsum(0), (1, 0)).to(
+            device=hidden_states.device, dtype=torch.int32
+        )
+        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+
         encoder_out = self.vision_model.encoder(
             hidden_states,
+            cu_seqlens,
+            max_seqlen,
             position_embeddings=position_embeddings,
             return_all_hidden_states=output_hidden_states,
         )
@@ -1069,11 +1102,18 @@ class Granite4VisionNaflexMultiModalProcessor(
         # dim=0 because Qwen2VL's processor has no leading dummy batch dim;
         # this processor's does, hence dim=1 here). spatial_shapes itself is
         # genuinely one row per image -> .batched().
+        #
+        # spatial_shapes MUST be keep_on_cpu: on a prefix-cache hit,
+        # strip_covered_mm_data drops every field of a fully-cached image except
+        # the keep_on_cpu ones (kept for M-RoPE models precisely so positions can
+        # still be computed). get_mrope_input_positions needs the real grid for
+        # every image -- the image's extent sets mrope_position_delta, which
+        # offsets all positions after the image and every decode step.
         spatial_shapes = hf_inputs.get("spatial_shapes", torch.empty((0, 2), dtype=torch.long))
         patch_counts = spatial_shapes[:, 0] * spatial_shapes[:, 1]
         return dict(
             pixel_values=MultiModalFieldConfig.flat_from_sizes("image", patch_counts, dim=1),
-            spatial_shapes=MultiModalFieldConfig.batched("image"),
+            spatial_shapes=MultiModalFieldConfig.batched("image", keep_on_cpu=True),
         )
 
     def _get_prompt_updates(
@@ -1446,17 +1486,22 @@ class Granite4VisionNaflexForConditionalGeneration(
             positions = torch.arange(len(input_tokens)).unsqueeze(0).expand(3, -1).clone()
             return positions, 0
 
-        kwargs = MultiModalFeatureSpec.gather_kwargs(mm_features, {"spatial_shapes"})
-        spatial_shapes_list = [
-            item.tolist() if torch.is_tensor(item) else list(item)
-            for item in kwargs.get("spatial_shapes", [])
-        ]
-
         ds = float(self._downsample_rate)
         has_nl = getattr(self.config, "use_image_newline", False)
-        image_blocks = [
-            [_ViewBlock("base", int(H * ds), int(W * ds), has_nl)] for H, W in spatial_shapes_list
-        ]
+        image_blocks = []
+        for feature in mm_features:
+            elem = feature.data.get("spatial_shapes") if feature.data is not None else None
+            if elem is None:
+                # spatial_shapes is keep_on_cpu, so it survives prefix-cache
+                # stripping; reaching here means that invariant broke. Fail loudly:
+                # any substitute grid gives a wrong extent and silently shifts
+                # every later position.
+                raise ValueError(
+                    f"granite4_vision_naflex: spatial_shapes missing for mm feature "
+                    f"{feature.identifier}; cannot compute M-RoPE positions."
+                )
+            H, W = elem.data.tolist()
+            image_blocks.append([_ViewBlock("base", int(H * ds), int(W * ds), has_nl)])
 
         input_ids = torch.tensor(input_tokens).unsqueeze(0)
         planes = _build_mrope_position_ids(
